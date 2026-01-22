@@ -64,14 +64,14 @@ float:
     module: ann_benchmarks.algorithms.nndescent_m
     name: nndescent_m
     run_groups:
-      NN-120-accurate:
-        arg_groups: [{pruning_prob: 0.125, leaf_size: 35, n_neighbors: 120, pruning_degree_multiplier: 2.5}]
-        args: {}
-        query_args: [[0.16, 0.2, 0.24, 0.28, 0.32, 0.36]]
-      NN-120-fast:
-        arg_groups: [{pruning_prob: 1.0, leaf_size: 20, n_neighbors: 120, pruning_degree_multiplier: 2.5}]
-        args: {}
-        query_args: [[0.0, 0.04, 0.08, 0.16, 0.2, 0.24, 0.28, 0.32]]
+      # NN-120-accurate:
+      #   arg_groups: [{pruning_prob: 0.125, leaf_size: 35, n_neighbors: 120, pruning_degree_multiplier: 2.5}]
+      #   args: {}
+      #   query_args: [[0.16, 0.2, 0.24, 0.28, 0.32, 0.36]]
+      # NN-120-fast:
+      #   arg_groups: [{pruning_prob: 1.0, leaf_size: 20, n_neighbors: 120, pruning_degree_multiplier: 2.5}]
+      #   args: {}
+      #   query_args: [[0.0, 0.04, 0.08, 0.16, 0.2, 0.24, 0.28, 0.32]]
       NN-20:
         arg_groups: [{pruning_prob: [1.0], leaf_size: 20, n_neighbors: [20], pruning_degree_multiplier: [
               0.5, 1.0]}]
@@ -82,14 +82,14 @@ float:
             pruning_degree_multiplier: [1.5]}]
         args: {}
         query_args: [[0.0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14, 0.16]]
-      NN-80-accurate:
-        arg_groups: [{pruning_prob: 0.25, leaf_size: 30, n_neighbors: 80, pruning_degree_multiplier: 2.0}]
-        args: {}
-        query_args: [[0.08, 0.12, 0.16, 0.2, 0.24, 0.28, 0.32, 0.36]]
-      NN-80-fast:
-        arg_groups: [{pruning_prob: 1.0, leaf_size: 20, n_neighbors: 80, pruning_degree_multiplier: 2.0}]
-        args: {}
-        query_args: [[0.0, 0.02, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24]]
+      # NN-80-accurate:
+      #   arg_groups: [{pruning_prob: 0.25, leaf_size: 30, n_neighbors: 80, pruning_degree_multiplier: 2.0}]
+      #   args: {}
+      #   query_args: [[0.08, 0.12, 0.16, 0.2, 0.24, 0.28, 0.32, 0.36]]
+      # NN-80-fast:
+      #   arg_groups: [{pruning_prob: 1.0, leaf_size: 20, n_neighbors: 80, pruning_degree_multiplier: 2.0}]
+      #   args: {}
+      #   query_args: [[0.0, 0.02, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24]]
   any:
   - base_args: ['@metric']
     constructor: NNDescentM

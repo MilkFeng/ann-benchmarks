@@ -144,7 +144,11 @@ class NNDescent {
     while (!top_candidates.empty()) {
       auto [dist, id] = top_candidates.top();
       top_candidates.pop();
-      top_k_candidates.push_back(id);
+
+      bool is_duplicate = std::ranges::contains(top_k_candidates, id);
+      if (!is_duplicate) {
+        top_k_candidates.push_back(id);
+      }
     }
     if (top_k_candidates.size() > k) {
       auto start_it = top_k_candidates.end() - k;
@@ -222,7 +226,7 @@ class NNDescent {
   }
 
   void build_graph() {
-    constexpr std::size_t max_iters = 20;
+    constexpr std::size_t max_iters = 30;
     for (const auto iter : std::views::iota(0u, max_iters)) {
       std::println("Starting iteration {}/{}...", iter + 1, max_iters);
 

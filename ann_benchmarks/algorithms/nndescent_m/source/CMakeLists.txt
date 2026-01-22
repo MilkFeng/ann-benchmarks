@@ -15,10 +15,12 @@ find_package(pybind11 CONFIG REQUIRED)
 
 pybind11_add_module(${SKBUILD_PROJECT_NAME} main.cpp)
 
-if(MSVC)
-    target_compile_options(nndescent_m PRIVATE /bigobj)
-else()
-    target_compile_options(nndescent_m PRIVATE -O3 -march=native)
+if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
+    target_compile_options(${SKBUILD_PROJECT_NAME} PRIVATE
+        $<$<CXX_COMPILER_ID:GNU>:-march=native -ffast-math>
+        $<$<CXX_COMPILER_ID:Clang>:-march=native -ffast-math>
+        $<$<CXX_COMPILER_ID:MSVC>:/arch:AVX2>
+    )
 endif()
 
 install(TARGETS ${SKBUILD_PROJECT_NAME} DESTINATION .)
