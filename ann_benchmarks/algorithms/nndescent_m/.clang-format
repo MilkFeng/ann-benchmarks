@@ -1,0 +1,6 @@
+BasedOnStyle: Google
+SpacesBeforeTrailingComments: 1
+QualifierAlignment: Left
+ColumnLimit: 120
+BreakBeforeBinaryOperators: NonAssignment
+AlignAfterOpenBracket: Align
