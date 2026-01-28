@@ -167,19 +167,10 @@ class NNDescent {
 
     clear_build_sketch();
 
-    visited_tags_.resize(num_elements_, 0);
-    current_query_tag_ = 0;
-
     std::println("Graph Index build complete.");
   }
 
   std::vector<uint32_t> query(const py_float_array_t query_vec, const size_t k, const float epsilon = 0.1f) {
-    ++current_query_tag_;
-    if (current_query_tag_ == 0) {
-      std::ranges::fill(visited_tags_, 0);
-      current_query_tag_ = 1;
-    }
-
     const auto buf = query_vec.request();
     assert(buf.ndim == 2);
 
@@ -190,7 +181,7 @@ class NNDescent {
     assert(dim == dim_);
 
     const float* query_raw_ptr = static_cast<const float*>(buf.ptr);
-    std::vector<float, AlignedAllocator<float>> query_storage = {query_raw_ptr, query_raw_ptr + dim_};
+    std::vector<float, AlignedAllocator<float>> query_storage = {query_raw_ptr, query_raw_ptr + dim_padded_};
 
     if (normalize_) {
       normalize_vec(query_storage.data());
@@ -201,74 +192,92 @@ class NNDescent {
     std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> candidates = {};
     std::priority_queue<Candidate> top_candidates = {};
 
+    std::vector<bool> visited(num_elements_, false);
+
+    const auto mark_visited = [&](const uint32_t id) { visited[id] = true; };
+    const auto is_visited = [&](const uint32_t id) { return visited[id]; };
+
     auto init_ids = query_rp_trees(query_ptr);
     if (init_ids.empty()) {
       init_ids.push_back(0);
     }
 
-    for (const auto id : init_ids) {
-      mark_visited(id);
-      const auto dist = compute_dist(query_ptr, get_vec(id));
+    std::vector<uint32_t> results(k, -1);
+    const auto size =
+        greedy_search(init_ids, candidates, top_candidates, is_visited, mark_visited, query_ptr, k, epsilon, results);
+    results.resize(size);
+    return results;
+  }
 
-      candidates.push({id, dist});
-      top_candidates.push({id, dist});
+  py::array_t<uint32_t> batch_query(const py_float_array_t query_vecs, const size_t k, const float epsilon = 0.1f) {
+    auto buf = query_vecs.request();
+    assert(buf.ndim == 2);
 
-      if (top_candidates.size() > k) {
-        top_candidates.pop();
+    const uint32_t num_queries = buf.shape[0];
+    const uint32_t dim = buf.shape[1];
+    assert(dim == dim_);
+
+    const float* queries_raw_ptr = static_cast<const float*>(buf.ptr);
+
+    auto result_array = py::array_t<uint32_t>(std::vector<py::ssize_t>{num_queries, static_cast<py::ssize_t>(k)});
+    auto result_ptr = static_cast<uint32_t*>(result_array.request().ptr);
+
+#pragma omp parallel
+    {
+      std::vector<float, AlignedAllocator<float>> query_storage(dim_padded_);
+
+      std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> candidates;
+      std::priority_queue<Candidate> top_candidates;
+
+      std::vector<uint32_t> init_ids;
+      init_ids.reserve(roots_.size() * leaf_size_);
+
+      std::vector<uint32_t> visited_tags(num_elements_, 0);
+      uint32_t query_tag = 0;
+
+      const auto mark_visited = [&](const uint32_t id) { visited_tags[id] = query_tag; };
+      const auto is_visited = [&](const uint32_t id) { return visited_tags[id] == query_tag; };
+
+#pragma omp for schedule(dynamic)
+      for (int32_t i = 0; i < num_queries; ++i) {
+        const float* current_query_raw = queries_raw_ptr + i * dim_;
+        std::memcpy(query_storage.data(), current_query_raw, sizeof(float) * dim_);
+        const float* query_ptr = query_storage.data();
+
+        if (normalize_) {
+          normalize_vec(query_storage.data());
+        }
+
+        while (!candidates.empty()) {
+          candidates.pop();
+        }
+        while (!top_candidates.empty()) {
+          top_candidates.pop();
+        }
+        init_ids.clear();
+
+        ++query_tag;
+        if (query_tag == 0) {
+          std::fill(visited_tags.begin(), visited_tags.end(), 0);
+          query_tag = 1;
+        }
+
+        for (const auto& root : roots_) {
+          const auto& result_leaf_indices = query_rp_tree(root.get(), query_ptr);
+          init_ids.insert(init_ids.end(), result_leaf_indices.begin(), result_leaf_indices.end());
+        }
+        sort_and_unique(init_ids);
+
+        if (init_ids.empty()) {
+          init_ids.push_back(0);
+        }
+
+        const auto size = greedy_search(init_ids, candidates, top_candidates, is_visited, mark_visited, query_ptr, k,
+                                        epsilon, {result_ptr + i * k, k});
       }
     }
 
-    while (!candidates.empty()) {
-      auto [curr_id, curr_dist] = candidates.top();
-      candidates.pop();
-
-      float search_radius = top_candidates.top().dist * (1.0f + epsilon);
-      if (top_candidates.size() >= k && curr_dist > search_radius) {
-        break;
-      }
-
-      for (auto [id, _1, _2] : graph_[curr_id]) {
-        if (is_visited(id)) {
-          continue;
-        }
-        mark_visited(id);
-
-        const auto dist = compute_dist(query_ptr, get_vec(id));
-
-        if (top_candidates.size() < k || dist < top_candidates.top().dist) {
-          top_candidates.push({id, dist});
-
-          if (top_candidates.size() > k) {
-            top_candidates.pop();
-          }
-
-          search_radius = top_candidates.top().dist * (1.0f + epsilon);
-        }
-
-        if (dist < search_radius) {
-          candidates.push({id, dist});
-        }
-      }
-    }
-
-    // get top k candidates
-    std::vector<uint32_t> top_k_candidates = {};
-    top_k_candidates.reserve(top_candidates.size());
-    while (!top_candidates.empty()) {
-      auto [id, dist] = top_candidates.top();
-      top_candidates.pop();
-
-      top_k_candidates.push_back(id);
-    }
-    if (top_k_candidates.size() > k) {
-      const auto start_it = top_k_candidates.end() - k;
-      std::vector<uint32_t> final_results = {start_it, top_k_candidates.end()};
-      std::ranges::reverse(final_results);
-      return final_results;
-    } else {
-      std::ranges::reverse(top_k_candidates);
-      return top_k_candidates;
-    }
+    return result_array;
   }
 
  private:
@@ -397,10 +406,6 @@ class NNDescent {
     old_candidates_sketch_.shrink_to_fit();
   }
 
-  bool is_visited(const uint32_t id) const { return visited_tags_[id] == current_query_tag_; }
-
-  void mark_visited(const uint32_t id) { visited_tags_[id] = current_query_tag_; }
-
   size_t get_lock_index(const uint32_t id) const { return id & (node_locks_.size() - 1); }
 
   std::lock_guard<std::mutex> lock_mutex(const uint32_t id, const uint32_t batch = 0) {
@@ -450,8 +455,8 @@ class NNDescent {
   }
 
   void build_rp_trees() {
-    const size_t dynamic_trees = 5 + std::round(std::sqrt(num_elements_) / 20.0);
-    const size_t n_trees = std::min(64uz, std::max(5uz, dynamic_trees));
+    const size_t dynamic_trees = 5 + std::pow(num_elements_, 0.25f);
+    const size_t n_trees = std::min(32uz, dynamic_trees);
 
     roots_.clear();
     roots_.resize(n_trees);
@@ -569,29 +574,34 @@ class NNDescent {
     return node;
   }
 
+  const std::vector<uint32_t>& query_rp_tree(const RPTreeNode* root, const float* query_vec) const {
+    const RPTreeNode* current_node = root;
+
+    while (!current_node->is_leaf) {
+      float dist_a = compute_dist(query_vec, get_vec(current_node->idx_a));
+      float dist_b = compute_dist(query_vec, get_vec(current_node->idx_b));
+
+      if (dist_a < dist_b) {
+        current_node = current_node->left.get();
+      } else {
+        current_node = current_node->right.get();
+      }
+    }
+
+    return current_node->leaf_indices;
+  }
+
   std::vector<uint32_t> query_rp_trees(const float* query_vec) {
     std::vector<uint32_t> candidate_indices = {};
+    candidate_indices.reserve(roots_.size() * leaf_size_);
 #pragma omp parallel
     {
       std::vector<uint32_t> local_candidates = {};
 
 #pragma omp for schedule(static)
       for (int32_t i = 0; i < roots_.size(); ++i) {
-        RPTreeNode* current_node = roots_[i].get();
-
-        while (!current_node->is_leaf) {
-          float dist_a = compute_dist(query_vec, get_vec(current_node->idx_a));
-          float dist_b = compute_dist(query_vec, get_vec(current_node->idx_b));
-
-          if (dist_a < dist_b) {
-            current_node = current_node->left.get();
-          } else {
-            current_node = current_node->right.get();
-          }
-        }
-
-        local_candidates.insert(local_candidates.end(), current_node->leaf_indices.begin(),
-                                current_node->leaf_indices.end());
+        const auto& result_leaf_indices = query_rp_tree(roots_[i].get(), query_vec);
+        local_candidates.insert(local_candidates.end(), result_leaf_indices.begin(), result_leaf_indices.end());
       }
 
       if (!local_candidates.empty()) {
@@ -830,6 +840,78 @@ class NNDescent {
     }
   }
 
+  size_t greedy_search(const std::vector<uint32_t>& init_ids,
+                       std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>>& candidates,
+                       std::priority_queue<Candidate>& top_candidates,
+                       const std::function<bool(const uint32_t)> is_visited,
+                       const std::function<void(const uint32_t)> mark_visited, const float* query_ptr, const size_t k,
+                       const float epsilon, const std::span<uint32_t> out_results) {
+    for (const auto id : init_ids) {
+      mark_visited(id);
+      const auto dist = compute_dist(query_ptr, get_vec(id));
+
+      candidates.push({id, dist});
+      top_candidates.push({id, dist});
+
+      if (top_candidates.size() > k) {
+        top_candidates.pop();
+      }
+    }
+
+    while (!candidates.empty()) {
+      auto [curr_id, curr_dist] = candidates.top();
+      candidates.pop();
+
+      float search_radius = top_candidates.top().dist * (1.0f + epsilon);
+      if (top_candidates.size() >= k && curr_dist > search_radius) {
+        break;
+      }
+
+      for (auto [id, _1, _2] : graph_[curr_id]) {
+        if (is_visited(id)) {
+          continue;
+        }
+        mark_visited(id);
+
+        const auto dist = compute_dist(query_ptr, get_vec(id));
+
+        if (top_candidates.size() < k || dist < top_candidates.top().dist) {
+          top_candidates.push({id, dist});
+
+          if (top_candidates.size() > k) {
+            top_candidates.pop();
+          }
+
+          search_radius = top_candidates.top().dist * (1.0f + epsilon);
+        }
+
+        if (dist < search_radius) {
+          candidates.push({id, dist});
+        }
+      }
+    }
+
+    // get top k candidates
+    std::vector<uint32_t> top_k_candidates = {};
+    top_k_candidates.reserve(top_candidates.size());
+    while (!top_candidates.empty()) {
+      auto [id, dist] = top_candidates.top();
+      top_candidates.pop();
+
+      top_k_candidates.push_back(id);
+    }
+    if (top_k_candidates.size() > k) {
+      const auto start_it = top_k_candidates.end() - k;
+      std::ranges::copy(start_it, top_k_candidates.end(), out_results.begin());
+      std::ranges::reverse(out_results);
+      return k;
+    } else {
+      std::ranges::reverse(top_k_candidates);
+      std::ranges::copy(top_k_candidates, out_results.begin());
+      return top_k_candidates.size();
+    }
+  }
+
  private:
   std::string metric_ = {};
   bool normalize_ = {};
@@ -858,10 +940,6 @@ class NNDescent {
   std::vector<std::mutex> node_locks_ = {};
   std::vector<std::mutex> node_locks_2_ = {};
 
-  // do not use std::vector<bool> to record visit status
-  std::vector<uint32_t> visited_tags_ = {};
-  uint32_t current_query_tag_ = {};
-
  private:
   static constexpr size_t num_locks_ = 4096;
 };
@@ -871,7 +949,8 @@ PYBIND11_MODULE(nndescent_m, m) {
       .def(py::init<std::string, size_t, float, float, size_t>(), py::arg("metric"), py::arg("n_neighbors"),
            py::arg("pruning_degree_multiplier"), py::arg("pruning_prob"), py::arg("leaf_size"))
       .def("fit", &NNDescent::fit, py::arg("input"))
-      .def("query", &NNDescent::query, py::arg("query_vec"), py::arg("k"), py::arg("epsilon") = 0.1f);
+      .def("query", &NNDescent::query, py::arg("query_vec"), py::arg("k"), py::arg("epsilon") = 0.1f)
+      .def("batch_query", &NNDescent::batch_query, py::arg("query_vecs"), py::arg("k"), py::arg("epsilon") = 0.1f);
 
   py::add_ostream_redirect(m, "ostream_redirect");
 }

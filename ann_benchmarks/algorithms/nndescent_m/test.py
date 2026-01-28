@@ -75,6 +75,18 @@ class NNDescentM:
             ind = self.index.query(v_f32, k=n, epsilon=self.epsilon)
         return ind  # BaseANN 期望返回索引列表
 
+    def batch_query(self, X, n):
+        if X.dtype != np.float32:
+            X = X.astype(np.float32)
+        if not X.flags["C_CONTIGUOUS"]:
+            X = np.ascontiguousarray(X)
+
+        with nndescent_m.ostream_redirect(stdout=True, stderr=True):
+            self.res = self.index.batch_query(X, k=n, epsilon=self.epsilon)
+
+    def get_batch_results(self):
+        return self.res
+
     def __str__(self):
         return (
             f"NNDescentM(n_neighbors={self.n_neighbors}, "
@@ -85,7 +97,7 @@ class NNDescentM:
         )
 
 
-def test(X_train, X_test, ground_truth, distance_metric):
+def test(X_train, X_test, ground_truth, distance_metric, batch_query=False):
     # 初始化算法
     params = {"n_neighbors": 40, "pruning_degree_multiplier": 1.5, "pruning_prob": 1.0, "leaf_size": 25}
 
@@ -108,25 +120,40 @@ def test(X_train, X_test, ground_truth, distance_metric):
     total_queries = len(X_test)
     query_start_time = time.time()
 
-    for i in range(len(X_test)):
-        # 你的 C++ query 接口
-        query_vec = X_test[i]
-        predicted_ids = algo.query(query_vec, k)
+    if batch_query:
+        algo.batch_query(X_test, k)
+        predicted_batch = algo.get_batch_results()
+        for i in range(len(X_test)):
+            predicted_ids = predicted_batch[i]
+            true_ids = set(ground_truth[i][:k])
+            predicted_set = set(predicted_ids)
 
-        # 简单的 Recall@K 计算
-        true_ids = set(ground_truth[i][:k])
-        # 注意：C++ 返回的是 list，直接用
-        predicted_set = set(predicted_ids)
+            intersection = true_ids.intersection(predicted_set)
+            hits += len(intersection)
+            total += k
 
-        intersection = true_ids.intersection(predicted_set)
-        hits += len(intersection)
-        total += k
+            if i == 0:
+                print("\n  [示例 Query #0]")
+                print(f"  预测: {predicted_ids}")
+                print(f"  真值: {true_ids}")
+                print(f"  重合: {intersection}/{k}")
+    else:
+        for i in range(len(X_test)):
+            query_vec = X_test[i]
+            predicted_ids = algo.query(query_vec, k)
 
-        if i == 0:
-            print("\n  [示例 Query #0]")
-            print(f"  预测: {predicted_ids}")
-            print(f"  真值: {true_ids}")
-            print(f"  重合: {intersection}/{k}")
+            true_ids = set(ground_truth[i][:k])
+            predicted_set = set(predicted_ids)
+
+            intersection = true_ids.intersection(predicted_set)
+            hits += len(intersection)
+            total += k
+
+            if i == 0:
+                print("\n  [示例 Query #0]")
+                print(f"  预测: {predicted_ids}")
+                print(f"  真值: {true_ids}")
+                print(f"  重合: {intersection}/{k}")
 
     print(f"\n[3/3] 结果验证...")
 
@@ -148,7 +175,7 @@ def test(X_train, X_test, ground_truth, distance_metric):
         print("\n⚠️ 召回率较低，请检查 C++ 的距离计算或构建参数。")
 
 
-def load_hdf5_and_test(filename):
+def load_hdf5_and_test(filename, batch_query=False):
     print(f"正在读取 {filename} ...")
     with h5py.File(filename, "r") as f:
         X_train = np.array(f["train"])
@@ -158,10 +185,10 @@ def load_hdf5_and_test(filename):
 
     print(f"数据加载完毕: Train={X_train.shape}, Test={X_test.shape}, Metric={distance_metric}")
 
-    test(X_train, X_test, ground_truth, distance_metric)
+    test(X_train, X_test, ground_truth, distance_metric, batch_query)
 
 
-def generate_and_test():
+def generate_and_test(batch_query=False):
     from sklearn.datasets import make_swiss_roll
     from sklearn.model_selection import train_test_split
     from sklearn.neighbors import NearestNeighbors
@@ -179,12 +206,13 @@ def generate_and_test():
     print(f"  测试集大小: {X_test.shape}")
     print(f"  距离度量: angular")
 
-    test(X_train, X_test, indices, distance_metric="angular")
+    test(X_train, X_test, indices, distance_metric="angular", batch_query=batch_query)
 
 
 if __name__ == "__main__":
     test_file = "C:\\Users\\31070\\Desktop\\PROGRAMS\\db\\ann-benchmarks\\data\\mnist-784-euclidean.hdf5"
     # test_file = "C:\\Users\\31070\\Desktop\\PROGRAMS\\db\\ann-benchmarks\\data\\glove-100-angular.hdf5"
-    load_hdf5_and_test(test_file)
+    load_hdf5_and_test(test_file, batch_query=True)
+    # load_hdf5_and_test(test_file, batch_query=False)
 
     # generate_and_test()

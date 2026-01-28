@@ -68,6 +68,18 @@ class NNDescentM(BaseANN):
             ind = self.index.query(v_f32, k=n, epsilon=self.epsilon)
         return ind
 
+    def batch_query(self, X, n):
+        if X.dtype != np.float32:
+            X = X.astype(np.float32)
+        if not X.flags["C_CONTIGUOUS"]:
+            X = np.ascontiguousarray(X)
+
+        with nndescent_m.ostream_redirect(stdout=True, stderr=True):
+            self.res = self.index.batch_query(X, k=n, epsilon=self.epsilon)
+
+    def get_batch_results(self):
+        return self.res
+
     def __str__(self):
         return (
             f"NNDescentM(n_neighbors={self.n_neighbors}, "
