@@ -183,8 +183,8 @@ def generate_and_test():
 
 
 if __name__ == "__main__":
-    # test_file = "C:\\Users\\31070\\Desktop\\PROGRAMS\\db\\ann-benchmarks\\data\\mnist-784-euclidean.hdf5"
-    test_file = "C:\\Users\\31070\\Desktop\\PROGRAMS\\db\\ann-benchmarks\\data\\glove-100-angular.hdf5"
+    test_file = "C:\\Users\\31070\\Desktop\\PROGRAMS\\db\\ann-benchmarks\\data\\mnist-784-euclidean.hdf5"
+    # test_file = "C:\\Users\\31070\\Desktop\\PROGRAMS\\db\\ann-benchmarks\\data\\glove-100-angular.hdf5"
     load_hdf5_and_test(test_file)
 
     # generate_and_test()
