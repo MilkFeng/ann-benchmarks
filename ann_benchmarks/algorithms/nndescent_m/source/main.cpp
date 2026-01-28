@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include <pybind11/iostream.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <ctime>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <print>
 #include <queue>
@@ -19,6 +21,49 @@
 namespace py = pybind11;
 
 using py_float_array_t = py::array_t<float, py::array::c_style | py::array::forcecast>;
+
+template <typename T, const size_t Alignment = 32>
+struct AlignedAllocator {
+  using value_type = T;
+
+  AlignedAllocator() noexcept = default;
+
+  template <typename U>
+  AlignedAllocator(const AlignedAllocator<U>&) noexcept {}
+
+  template <typename U>
+  struct rebind {
+    using other = AlignedAllocator<U, Alignment>;
+  };
+
+  T* allocate(size_t n) {
+    if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
+      throw std::bad_alloc();
+    }
+
+    void* ptr = nullptr;
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    ptr = _aligned_malloc(n * sizeof(T), Alignment);
+#else
+    if (posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0) {
+      ptr = nullptr;
+    }
+#endif
+    if (ptr == nullptr) {
+      throw std::bad_alloc();
+    }
+    return static_cast<T*>(ptr);
+  }
+
+  void deallocate(T* p, size_t) noexcept {
+#if defined(_MSC_VER) || defined(__MINGW32__)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+  }
+};
 
 struct Neighbor {
   uint32_t id = {};
@@ -145,8 +190,6 @@ class NNDescent {
 
     const float* query_ptr = query_storage.data();
 
-    const size_t ef = std::max(k, static_cast<size_t>(k * (1.0f + epsilon)));
-
     std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> candidates = {};
     std::priority_queue<Candidate> top_candidates = {};
 
@@ -161,33 +204,41 @@ class NNDescent {
 
       candidates.push({id, dist});
       top_candidates.push({id, dist});
+
+      if (top_candidates.size() > k) {
+        top_candidates.pop();
+      }
     }
 
     while (!candidates.empty()) {
-      auto [id, dist] = candidates.top();
+      auto [curr_id, curr_dist] = candidates.top();
       candidates.pop();
 
-      // if top_candidates is full and the new distance is greater than the worst distance in top_candidates, skip
-      if (top_candidates.size() >= ef && dist > top_candidates.top().dist) {
+      float search_radius = top_candidates.top().dist * (1.0f + epsilon);
+      if (top_candidates.size() >= k && curr_dist > search_radius) {
         break;
       }
 
-      for (auto [neighbor_id, dist, _] : graph_[id]) {
-        if (is_visited(neighbor_id)) {
+      for (auto [id, _1, _2] : graph_[curr_id]) {
+        if (is_visited(id)) {
           continue;
         }
-        mark_visited(neighbor_id);
+        mark_visited(id);
 
-        const auto new_dist = compute_dist(query_ptr, get_vec(neighbor_id));
+        const auto dist = compute_dist(query_ptr, get_vec(id));
 
-        if (top_candidates.size() < ef || new_dist < top_candidates.top().dist) {
-          candidates.push({neighbor_id, new_dist});
-          top_candidates.push({neighbor_id, new_dist});
+        if (top_candidates.size() < k || dist < top_candidates.top().dist) {
+          top_candidates.push({id, dist});
 
-          // if top_candidates is full, pop the worst candidate
-          if (top_candidates.size() > ef) {
+          if (top_candidates.size() > k) {
             top_candidates.pop();
           }
+
+          search_radius = top_candidates.top().dist * (1.0f + epsilon);
+        }
+
+        if (dist < search_radius) {
+          candidates.push({id, dist});
         }
       }
     }
@@ -233,10 +284,34 @@ class NNDescent {
 
   float compute_dist(const float* a, const float* b) const {
     float dist = 0.0f;
-    for (const auto i : std::views::iota(0u, dim_)) {
+
+    const size_t dim_aligned = dim_ - (dim_ % 8);
+    const size_t dim_remaining = dim_ % 8;
+
+    if (dim_aligned > 0) {
+      __m256 sum_vec = _mm256_setzero_ps();
+      for (size_t i = 0; i < dim_aligned; i += 8) {
+        __m256 vec_a = _mm256_load_ps(&a[i]);
+        __m256 vec_b = _mm256_load_ps(&b[i]);
+        __m256 diff = _mm256_sub_ps(vec_a, vec_b);
+        sum_vec = _mm256_fmadd_ps(diff, diff, sum_vec);
+      }
+
+      __m128 vlow = _mm256_castps256_ps128(sum_vec);
+      __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
+      __m128 vsum = _mm_add_ps(vlow, vhigh);
+
+      vsum = _mm_hadd_ps(vsum, vsum);
+      vsum = _mm_hadd_ps(vsum, vsum);
+
+      dist += _mm_cvtss_f32(vsum);
+    }
+
+    for (const auto i : std::views::iota(dim_aligned, dim_)) {
       float diff = a[i] - b[i];
       dist += diff * diff;
     }
+
     return dist;
   }
 
@@ -631,7 +706,7 @@ class NNDescent {
   size_t num_elements_ = {};
   size_t dim_ = {};
 
-  std::vector<float> data_ = {};
+  std::vector<float, AlignedAllocator<float, 32>> data_ = {};
 
   std::vector<std::unique_ptr<RPTreeNode>> roots_ = {};
 
