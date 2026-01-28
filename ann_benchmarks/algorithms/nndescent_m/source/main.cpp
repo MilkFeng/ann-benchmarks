@@ -1,4 +1,5 @@
 #include <immintrin.h>
+#include <omp.h>
 #include <pybind11/iostream.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <print>
@@ -44,9 +46,9 @@ struct AlignedAllocator {
     void* ptr = nullptr;
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
-    ptr = _aligned_malloc(n * sizeof(T), Alignment);
+    ptr = _aligned_malloc(sizeof(T) * n, Alignment);
 #else
-    if (posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0) {
+    if (posix_memalign(&ptr, Alignment, sizeof(T) * n) != 0) {
       ptr = nullptr;
     }
 #endif
@@ -110,8 +112,7 @@ class NNDescent {
         n_neighbors_(n_neighbors),
         pruning_degree_multiplier_(pruning_degree_multiplier),
         pruning_prob_(pruning_prob),
-        leaf_size_(leaf_size),
-        rng_(std::time(nullptr)) {
+        leaf_size_(leaf_size) {
     max_candidates_ = std::min(60uz, n_neighbors_);
 
     if (metric_ == "euclidean") {
@@ -129,10 +130,15 @@ class NNDescent {
 
     num_elements_ = buf.shape[0];
     dim_ = buf.shape[1];
+    dim_padded_ = (dim_ + 7) & ~7;
+    dim_aligned_ = dim_ - (dim_ & 7);
     const float* raw_data_ptr = static_cast<const float*>(buf.ptr);
 
-    data_.resize(num_elements_ * dim_);
-    std::memcpy(data_.data(), raw_data_ptr, sizeof(float) * num_elements_ * dim_);
+    data_.resize(num_elements_ * dim_padded_);
+    for (size_t i = 0; i < num_elements_; ++i) {
+      float* row_ptr = &data_[i * dim_padded_];
+      std::memcpy(row_ptr, raw_data_ptr + i * dim_, sizeof(float) * dim_);
+    }
 
     if (normalize_) {
       std::println("Normalizing dataset for angular metric...");
@@ -142,6 +148,8 @@ class NNDescent {
     }
 
     graph_.resize(num_elements_);
+    node_locks_ = std::vector<std::mutex>(num_locks_);
+    node_locks_2_ = std::vector<std::mutex>(num_locks_);
 
     init_build_sketch();
 
@@ -182,7 +190,7 @@ class NNDescent {
     assert(dim == dim_);
 
     const float* query_raw_ptr = static_cast<const float*>(buf.ptr);
-    std::vector<float> query_storage = {query_raw_ptr, query_raw_ptr + dim_};
+    std::vector<float, AlignedAllocator<float>> query_storage = {query_raw_ptr, query_raw_ptr + dim_};
 
     if (normalize_) {
       normalize_vec(query_storage.data());
@@ -264,33 +272,65 @@ class NNDescent {
   }
 
  private:
-  const float* get_vec(const uint32_t id) const { return &data_[id * dim_]; }
+  const float* get_vec(const uint32_t id) const { return &data_[id * dim_padded_]; }
 
-  float* get_vec(const uint32_t id) { return &data_[id * dim_]; }
+  float* get_vec(const uint32_t id) { return &data_[id * dim_padded_]; }
 
   void normalize_vec(float* vec) const {
-    float sum_sq = 0.0f;
-    for (const auto i : std::views::iota(0u, dim_)) {
-      sum_sq += vec[i] * vec[i];
-    }
+    float sum_sq = compute_squared_norm(vec);
 
     if (sum_sq > 1e-12f) {
       float norm_inv = 1.0f / std::sqrt(sum_sq);
-      for (const auto i : std::views::iota(0u, dim_)) {
+
+      if (dim_aligned_ > 0) {
+        __m256 inv_vec = _mm256_set1_ps(norm_inv);
+
+        for (size_t i = 0; i < dim_aligned_; i += 8) {
+          __m256 v = _mm256_load_ps(&vec[i]);
+          v = _mm256_mul_ps(v, inv_vec);
+          _mm256_store_ps(&vec[i], v);
+        }
+      }
+
+      for (const auto i : std::views::iota(dim_aligned_, dim_)) {
         vec[i] *= norm_inv;
       }
     }
   }
 
+  float compute_squared_norm(const float* vec) const {
+    float sum_sq = 0.0f;
+
+    if (dim_aligned_ > 0) {
+      __m256 sum_vec = _mm256_setzero_ps();
+      for (size_t i = 0; i < dim_aligned_; i += 8) {
+        __m256 v = _mm256_load_ps(&vec[i]);
+        sum_vec = _mm256_fmadd_ps(v, v, sum_vec);
+      }
+
+      __m128 vlow = _mm256_castps256_ps128(sum_vec);
+      __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
+      __m128 vsum = _mm_add_ps(vlow, vhigh);
+
+      vsum = _mm_hadd_ps(vsum, vsum);
+      vsum = _mm_hadd_ps(vsum, vsum);
+
+      sum_sq += _mm_cvtss_f32(vsum);
+    }
+
+    for (const auto i : std::views::iota(dim_aligned_, dim_)) {
+      sum_sq += vec[i] * vec[i];
+    }
+
+    return sum_sq;
+  }
+
   float compute_dist(const float* a, const float* b) const {
     float dist = 0.0f;
 
-    const size_t dim_aligned = dim_ - (dim_ % 8);
-    const size_t dim_remaining = dim_ % 8;
-
-    if (dim_aligned > 0) {
+    if (dim_aligned_ > 0) {
       __m256 sum_vec = _mm256_setzero_ps();
-      for (size_t i = 0; i < dim_aligned; i += 8) {
+      for (size_t i = 0; i < dim_aligned_; i += 8) {
         __m256 vec_a = _mm256_load_ps(&a[i]);
         __m256 vec_b = _mm256_load_ps(&b[i]);
         __m256 diff = _mm256_sub_ps(vec_a, vec_b);
@@ -307,7 +347,7 @@ class NNDescent {
       dist += _mm_cvtss_f32(vsum);
     }
 
-    for (const auto i : std::views::iota(dim_aligned, dim_)) {
+    for (const auto i : std::views::iota(dim_aligned_, dim_)) {
       float diff = a[i] - b[i];
       dist += diff * diff;
     }
@@ -332,7 +372,7 @@ class NNDescent {
   }
 
   template <typename T>
-  void insert_with_order(std::vector<T>& items, const T& new_item) {
+  static void insert_with_order(std::vector<T>& items, const T& new_item) {
     const auto insert_it = std::ranges::lower_bound(items, new_item.dist, std::less{}, &T::dist);
     items.insert(insert_it, new_item);
   }
@@ -361,58 +401,117 @@ class NNDescent {
 
   void mark_visited(const uint32_t id) { visited_tags_[id] = current_query_tag_; }
 
+  size_t get_lock_index(const uint32_t id) const { return id & (node_locks_.size() - 1); }
+
+  std::lock_guard<std::mutex> lock_mutex(const uint32_t id, const uint32_t batch = 0) {
+    assert(batch == 0 || batch == 1);
+    if (batch == 0) {
+      return std::lock_guard<std::mutex>(node_locks_[get_lock_index(id)]);
+    } else {
+      return std::lock_guard<std::mutex>(node_locks_2_[get_lock_index(id)]);
+    }
+  }
+
+  void connect_safe(std::vector<std::vector<Neighbor>>& graph, const uint32_t u, const uint32_t v, const float dist) {
+    std::lock_guard<std::mutex> lock = lock_mutex(u);
+    graph[u].emplace_back(v, dist, true);
+  }
+
+  void connect_safe(const uint32_t u, const uint32_t v, const float dist) {
+    std::lock_guard<std::mutex> lock = lock_mutex(u);
+    graph_[u].emplace_back(v, dist, true);
+  }
+
+  bool contains_safe(const uint32_t u, const uint32_t v) {
+    std::lock_guard<std::mutex> lock = lock_mutex(u);
+    return std::ranges::contains(graph_[u], v, &Neighbor::id);
+  }
+
+  bool contains_safe(const std::vector<std::vector<Neighbor>>& graph, const uint32_t u, const uint32_t v) {
+    std::lock_guard<std::mutex> lock = lock_mutex(u);
+    return std::ranges::contains(graph[u], v, &Neighbor::id);
+  }
+
+  bool contains_safe(const std::vector<std::vector<Candidate>>& candidates, const uint32_t u, const uint32_t v,
+                     const uint32_t batch = 0) {
+    std::lock_guard<std::mutex> lock = lock_mutex(u);
+    return std::ranges::contains(candidates[u], v, &Candidate::id);
+  }
+
   void initialize_graph() {
     build_rp_trees();
 
-    for (auto& neighbors : graph_) {
-      sort_and_unique(neighbors);
+#pragma omp parallel for schedule(static)
+    for (int32_t i = 0; i < num_elements_; ++i) {
+      sort_and_unique(graph_[i]);
     }
 
     randomly_fill_graph();
   }
 
   void build_rp_trees() {
-    roots_.clear();
-
-    std::vector<uint32_t> indices(num_elements_);
-    std::ranges::iota(indices, 0);
-
     const size_t dynamic_trees = 5 + std::round(std::sqrt(num_elements_) / 20.0);
     const size_t n_trees = std::min(64uz, std::max(5uz, dynamic_trees));
 
+    roots_.clear();
+    roots_.resize(n_trees);
+
     std::println("Building {} RP Trees...", n_trees);
 
-    for (const auto tree_iter : std::views::iota(0u, n_trees)) {
-      std::ranges::shuffle(indices, rng_);
-      auto root = build_rp_tree(indices);
-      roots_.emplace_back(std::move(root));
+    const size_t seed = std::time(nullptr);
+#pragma omp parallel
+    {
+      std::mt19937 rng(seed + omp_get_thread_num());
+
+      std::vector<uint32_t> indices(num_elements_);
+      std::ranges::iota(indices, 0u);
+
+#pragma omp for schedule(dynamic)
+      for (int32_t i = 0; i < n_trees; ++i) {
+        std::ranges::shuffle(indices, rng);
+        roots_[i] = build_rp_tree(indices, rng);
+      }
     }
   }
 
   void randomly_fill_graph() {
+    const size_t seed = std::time(nullptr);
     std::uniform_int_distribution<uint32_t> dist_gen{0u, static_cast<uint32_t>(num_elements_ - 1)};
 
     const size_t target_size = std::min(static_cast<size_t>(n_neighbors_), num_elements_ - 1);
-    for (const auto& [id, neighbors] : std::views::enumerate(graph_)) {
-      while (neighbors.size() < target_size) {
-        auto rand_id = dist_gen(rng_);
-        if (rand_id == id) {
-          continue;
+
+#pragma omp parallel
+    {
+      std::mt19937 rng(seed + omp_get_thread_num());
+
+#pragma omp for schedule(dynamic, 128)
+      for (int32_t id = 0; id < num_elements_; ++id) {
+        auto& neighbors = graph_[id];
+
+        if (neighbors.capacity() < target_size) {
+          neighbors.reserve(target_size);
         }
 
-        const bool exists = std::ranges::contains(neighbors, rand_id, &Neighbor::id);
-        if (!exists) {
-          insert_with_order(neighbors, {rand_id, compute_dist(id, rand_id), true});
-        }
-      }
+        while (neighbors.size() < target_size) {
+          auto rand_id = dist_gen(rng);
+          if (rand_id == id) {
+            continue;
+          }
 
-      if (neighbors.size() > n_neighbors_) {
-        neighbors.resize(n_neighbors_);
+          const bool exists = std::ranges::contains(neighbors, rand_id, &Neighbor::id);
+          if (!exists) {
+            insert_with_order(neighbors, {rand_id, compute_dist(id, rand_id), true});
+          }
+        }
+
+        if (neighbors.size() > n_neighbors_) {
+          neighbors.resize(n_neighbors_);
+        }
       }
     }
   }
 
-  std::unique_ptr<RPTreeNode> build_rp_tree(const std::span<uint32_t> indices) {
+  std::unique_ptr<RPTreeNode> build_rp_tree(const std::span<uint32_t> indices, std::mt19937 rng) {
     auto node = std::make_unique<RPTreeNode>();
 
     if (indices.size() <= leaf_size_) {
@@ -427,8 +526,8 @@ class NNDescent {
           uint32_t v = indices[j];
           float d = compute_dist(u, v);
 
-          graph_[u].emplace_back(v, d, true);
-          graph_[v].emplace_back(u, d, true);
+          connect_safe(u, v, d);
+          connect_safe(v, u, d);
         }
       }
       return node;
@@ -438,12 +537,12 @@ class NNDescent {
     // left partition: closer to idx_a
     // right partition: closer to idx_b
     std::uniform_int_distribution<size_t> idx_dist{0, indices.size() - 1};
-    uint32_t idx_a = indices[idx_dist(rng_)];
-    uint32_t idx_b = indices[idx_dist(rng_)];
+    uint32_t idx_a = indices[idx_dist(rng)];
+    uint32_t idx_b = indices[idx_dist(rng)];
 
     uint32_t attempts = 0;
     while (idx_a == idx_b && attempts < 10) {
-      idx_b = indices[idx_dist(rng_)];
+      idx_b = indices[idx_dist(rng)];
       ++attempts;
     }
 
@@ -460,35 +559,47 @@ class NNDescent {
     auto left_count = indices.size() - right_count;
 
     if (left_count == 0 || right_count == 0) {
-      std::ranges::shuffle(indices, rng_);
+      std::ranges::shuffle(indices, rng);
       left_count = indices.size() / 2;
     }
 
-    node->left = build_rp_tree(indices.first(left_count));
-    node->right = build_rp_tree(indices.subspan(left_count));
+    node->left = build_rp_tree(indices.first(left_count), rng);
+    node->right = build_rp_tree(indices.subspan(left_count), rng);
 
     return node;
   }
 
   std::vector<uint32_t> query_rp_trees(const float* query_vec) {
     std::vector<uint32_t> candidate_indices = {};
+#pragma omp parallel
+    {
+      std::vector<uint32_t> local_candidates = {};
 
-    for (const auto& root : roots_) {
-      RPTreeNode* current_node = root.get();
+#pragma omp for schedule(static)
+      for (int32_t i = 0; i < roots_.size(); ++i) {
+        RPTreeNode* current_node = roots_[i].get();
 
-      while (!current_node->is_leaf) {
-        float dist_a = compute_dist(query_vec, get_vec(current_node->idx_a));
-        float dist_b = compute_dist(query_vec, get_vec(current_node->idx_b));
+        while (!current_node->is_leaf) {
+          float dist_a = compute_dist(query_vec, get_vec(current_node->idx_a));
+          float dist_b = compute_dist(query_vec, get_vec(current_node->idx_b));
 
-        if (dist_a < dist_b) {
-          current_node = current_node->left.get();
-        } else {
-          current_node = current_node->right.get();
+          if (dist_a < dist_b) {
+            current_node = current_node->left.get();
+          } else {
+            current_node = current_node->right.get();
+          }
         }
+
+        local_candidates.insert(local_candidates.end(), current_node->leaf_indices.begin(),
+                                current_node->leaf_indices.end());
       }
 
-      candidate_indices.insert(candidate_indices.end(), current_node->leaf_indices.begin(),
-                               current_node->leaf_indices.end());
+      if (!local_candidates.empty()) {
+#pragma omp critical
+        {
+          candidate_indices.insert(candidate_indices.end(), local_candidates.begin(), local_candidates.end());
+        }
+      }
     }
 
     // remove duplicates
@@ -500,7 +611,9 @@ class NNDescent {
     constexpr size_t max_iters = 30;
     const size_t min_updates_threshold = std::max<size_t>(100uz, num_elements_ * n_neighbors_ * 0.001);
 
-    const auto try_connect_mono = [&](const uint32_t u, const uint32_t v, const float dist) {
+    const auto try_connect_mono_safe = [&](const uint32_t u, const uint32_t v, const float dist) {
+      std::lock_guard<std::mutex> lock_guard = lock_mutex(u);
+
       auto& neighbors = graph_[u];
       if (neighbors.size() < n_neighbors_ || dist < neighbors.back().dist) {
         insert_with_order(neighbors, {v, dist, true});
@@ -512,13 +625,13 @@ class NNDescent {
       return false;
     };
 
-    const auto try_connect = [&](const uint32_t u, const uint32_t v) {
+    const auto try_connect_safe = [&](const uint32_t u, const uint32_t v) {
       if (u == v) {
         return false;
       }
 
-      const auto u_has_v = std::ranges::contains(graph_[u], v, &Neighbor::id);
-      const auto v_has_u = std::ranges::contains(graph_[v], u, &Neighbor::id);
+      const auto u_has_v = contains_safe(u, v);
+      const auto v_has_u = contains_safe(v, u);
       if (u_has_v && v_has_u) {
         return false;
       }
@@ -527,11 +640,11 @@ class NNDescent {
       bool changed = false;
 
       if (!u_has_v) {
-        changed |= try_connect_mono(u, v, dist);
+        changed |= try_connect_mono_safe(u, v, dist);
       }
 
       if (!v_has_u) {
-        changed |= try_connect_mono(v, u, dist);
+        changed |= try_connect_mono_safe(v, u, dist);
       }
 
       return changed;
@@ -544,14 +657,15 @@ class NNDescent {
 
       size_t updates = 0;
 
-      for (const auto u : std::views::iota(0u, num_elements_)) {
+#pragma omp parallel for schedule(dynamic) reduction(+ : updates)
+      for (int32_t u = 0; u < num_elements_; ++u) {
         const auto& new_candidates = new_candidates_sketch_[u];
         const auto& old_candidates = old_candidates_sketch_[u];
 
         // new-new
         for (const auto i : std::views::iota(0u, new_candidates.size())) {
           for (const auto j : std::views::iota(i + 1u, new_candidates.size())) {
-            if (try_connect(new_candidates[i].id, new_candidates[j].id)) {
+            if (try_connect_safe(new_candidates[i].id, new_candidates[j].id)) {
               ++updates;
             }
           }
@@ -560,7 +674,7 @@ class NNDescent {
         // new-old
         for (const auto& new_candidate : new_candidates) {
           for (const auto& old_candidate : old_candidates) {
-            if (try_connect(new_candidate.id, old_candidate.id)) {
+            if (try_connect_safe(new_candidate.id, old_candidate.id)) {
               ++updates;
             }
           }
@@ -576,49 +690,61 @@ class NNDescent {
   }
 
   void sample_candidates() {
-    for (auto& candidates : new_candidates_sketch_) {
-      candidates.clear();
-    }
-    for (auto& candidates : old_candidates_sketch_) {
-      candidates.clear();
+#pragma omp parallel for schedule(static, 256)
+    for (int32_t i = 0; i < num_elements_; ++i) {
+      new_candidates_sketch_[i].clear();
+      old_candidates_sketch_[i].clear();
     }
 
-    const auto checked_push = [&](std::vector<Candidate>& candidates, const uint32_t id, const float priority) {
-      if (candidates.size() >= max_candidates_ && priority >= candidates.back().dist) {
+    const auto checked_push = [&](std::vector<std::vector<Candidate>>& candidates, const uint32_t u, const uint32_t v,
+                                  const float priority, const uint32_t batch) -> bool {
+      std::lock_guard<std::mutex> lock_guard = lock_mutex(u, batch);
+
+      if (candidates[u].size() >= max_candidates_ && priority >= candidates[u].back().dist) {
         return false;
       }
 
-      const bool exists = std::ranges::contains(candidates, id, &Candidate::id);
+      const bool exists = std::ranges::contains(candidates[u], v, &Candidate::id);
       if (exists) {
         return false;
       }
 
-      insert_with_order(candidates, {id, priority});
+      insert_with_order(candidates[u], {v, priority});
 
-      if (candidates.size() > max_candidates_) {
-        candidates.pop_back();
+      if (candidates[u].size() > max_candidates_) {
+        candidates[u].pop_back();
       }
 
       return true;
     };
 
+    const size_t seed = std::time(nullptr);
     std::uniform_real_distribution<float> priority_dist{0.0f, 1.0f};
+#pragma omp parallel
+    {
+      std::mt19937 rng(seed + omp_get_thread_num());
 
-    for (const auto& [u, neighbors] : std::views::enumerate(graph_)) {
-      for (const auto [v, dist, is_new] : neighbors) {
-        const auto priority = priority_dist(rng_);
-        if (is_new) {
-          checked_push(new_candidates_sketch_[u], v, priority);
-          checked_push(new_candidates_sketch_[v], u, priority);
-        } else {
-          checked_push(old_candidates_sketch_[u], v, priority);
-          checked_push(old_candidates_sketch_[v], u, priority);
+#pragma omp for schedule(dynamic)
+      for (int32_t u = 0; u < num_elements_; ++u) {
+        auto& neighbors = graph_[u];
+        for (const auto [v, dist, is_new] : neighbors) {
+          const auto priority = priority_dist(rng);
+          if (is_new) {
+            checked_push(new_candidates_sketch_, u, v, priority, 0);
+            checked_push(new_candidates_sketch_, v, u, priority, 0);
+          } else {
+            checked_push(old_candidates_sketch_, u, v, priority, 1);
+            checked_push(old_candidates_sketch_, v, u, priority, 1);
+          }
         }
       }
     }
 
     // mark sampled candidates as old
-    for (const auto& [u, neighbors] : std::views::enumerate(graph_)) {
+
+#pragma omp parallel for schedule(dynamic)
+    for (int32_t u = 0; u < num_elements_; ++u) {
+      auto& neighbors = graph_[u];
       for (auto& [v, _, is_new] : neighbors) {
         if (!is_new) {
           continue;
@@ -633,16 +759,19 @@ class NNDescent {
 
   void add_reverse_edges() {
     std::vector<std::vector<Neighbor>> reverse_graph(num_elements_);
-
-    for (const auto& [id, neighbors] : std::views::enumerate(graph_)) {
-      for (auto& neighbor : neighbors) {
-        reverse_graph[neighbor.id].emplace_back(static_cast<uint32_t>(id), neighbor.dist);
+#pragma omp parallel for schedule(dynamic)
+    for (int32_t u = 0; u < num_elements_; ++u) {
+      for (const auto& neighbor : graph_[u]) {
+        connect_safe(reverse_graph, neighbor.id, u, neighbor.dist);
       }
     }
 
-    for (const auto& [id, new_edges] : std::views::enumerate(reverse_graph)) {
+#pragma omp parallel for
+    for (int32_t id = 0; id < num_elements_; ++id) {
       auto& neighbors = graph_[id];
-      neighbors.insert(neighbors.end(), new_edges.begin(), new_edges.end());
+      auto& new_neighbors = reverse_graph[id];
+
+      neighbors.insert(neighbors.end(), new_neighbors.begin(), new_neighbors.end());
 
       sort_and_unique(neighbors);
       if (neighbors.size() > n_neighbors_) {
@@ -658,37 +787,46 @@ class NNDescent {
 
     const size_t max_degree = n_neighbors_ * pruning_degree_multiplier_;
 
+    const size_t seed = std::time(nullptr);
     std::uniform_real_distribution<float> prob_dist{0.0f, 1.0f};
 
-    for (auto& neighbors : graph_) {
-      std::vector<Neighbor> pruned_neighbors = {};
-      pruned_neighbors.reserve(max_degree);
+#pragma omp parallel
+    {
+      std::mt19937 rng(seed + omp_get_thread_num());
 
-      // enumerate candidates from closest to furthest
-      for (const auto& candidate : neighbors) {
-        if (pruned_neighbors.size() >= max_degree) {
-          break;
-        }
+#pragma omp for schedule(dynamic)
+      for (int32_t i = 0; i < num_elements_; ++i) {
+        auto& neighbors = graph_[i];
 
-        // check if candidate is shadowed by existing neighbors
-        bool keep = true;
-        for (const auto& existing : pruned_neighbors) {
-          float dist = compute_dist(existing.id, candidate.id);
-          if (dist < candidate.dist) {
-            // keep it with probability
-            if (prob_dist(rng_) < pruning_prob_) {
-              keep = false;
-              break;
+        std::vector<Neighbor> pruned_neighbors = {};
+        pruned_neighbors.reserve(max_degree);
+
+        // enumerate candidates from closest to furthest
+        for (const auto& candidate : neighbors) {
+          if (pruned_neighbors.size() >= max_degree) {
+            break;
+          }
+
+          // check if candidate is shadowed by existing neighbors
+          bool keep = true;
+          for (const auto& existing : pruned_neighbors) {
+            float dist = compute_dist(existing.id, candidate.id);
+            if (dist < candidate.dist) {
+              // keep it with probability
+              if (prob_dist(rng) < pruning_prob_) {
+                keep = false;
+                break;
+              }
             }
+          }
+
+          if (keep) {
+            pruned_neighbors.push_back(candidate);
           }
         }
 
-        if (keep) {
-          pruned_neighbors.push_back(candidate);
-        }
+        neighbors = std::move(pruned_neighbors);
       }
-
-      neighbors = std::move(pruned_neighbors);
     }
   }
 
@@ -705,8 +843,10 @@ class NNDescent {
 
   size_t num_elements_ = {};
   size_t dim_ = {};
+  size_t dim_padded_ = {};
+  size_t dim_aligned_ = {};
 
-  std::vector<float, AlignedAllocator<float, 32>> data_ = {};
+  std::vector<float, AlignedAllocator<float>> data_ = {};
 
   std::vector<std::unique_ptr<RPTreeNode>> roots_ = {};
 
@@ -715,12 +855,15 @@ class NNDescent {
   std::vector<std::vector<Candidate>> old_candidates_sketch_ = {};
 
   std::vector<std::vector<Neighbor>> graph_ = {};
+  std::vector<std::mutex> node_locks_ = {};
+  std::vector<std::mutex> node_locks_2_ = {};
 
   // do not use std::vector<bool> to record visit status
   std::vector<uint32_t> visited_tags_ = {};
   uint32_t current_query_tag_ = {};
 
-  std::mt19937 rng_ = {};
+ private:
+  static constexpr size_t num_locks_ = 4096;
 };
 
 PYBIND11_MODULE(nndescent_m, m) {

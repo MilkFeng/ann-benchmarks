@@ -87,7 +87,7 @@ class NNDescentM:
 
 def test(X_train, X_test, ground_truth, distance_metric):
     # 初始化算法
-    params = {"n_neighbors": 20, "pruning_degree_multiplier": 0.5, "pruning_prob": 1.0, "leaf_size": 20}
+    params = {"n_neighbors": 40, "pruning_degree_multiplier": 1.5, "pruning_prob": 1.0, "leaf_size": 25}
 
     print("\n[1/3] 初始化与构建索引 (Fit)...")
     algo = NNDescentM(distance_metric, params)
@@ -99,7 +99,7 @@ def test(X_train, X_test, ground_truth, distance_metric):
     print(f"构建结果：\n{algo}")
 
     print("\n[2/3] 执行查询 (Query)...")
-    algo.set_query_arguments(epsilon=0.2)
+    algo.set_query_arguments(epsilon=0.12)
 
     k = 10
     hits = 0

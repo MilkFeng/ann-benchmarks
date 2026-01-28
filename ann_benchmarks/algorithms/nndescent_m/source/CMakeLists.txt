@@ -13,7 +13,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 CONFIG REQUIRED)
 
+find_package(OpenMP REQUIRED)
+
 pybind11_add_module(${SKBUILD_PROJECT_NAME} main.cpp)
+
+if(OPENMP_FOUND)
+    target_link_libraries(${SKBUILD_PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_options(${SKBUILD_PROJECT_NAME} PRIVATE
