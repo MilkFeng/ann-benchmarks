@@ -6,16 +6,17 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <numeric>
 #include <print>
 #include <queue>
-#include <random>
 #include <ranges>
 #include <utility>
 #include <vector>
@@ -104,6 +105,76 @@ struct RPTreeNode {
   std::vector<uint32_t> leaf_indices = {};
 };
 
+class FastRandom {
+ public:
+  FastRandom(uint64_t seed = 0) {
+    if (seed == 0) {
+      seed = gen_seed();
+    }
+    state_[0] = splitmix64(seed);
+    state_[1] = splitmix64(seed);
+    state_[2] = splitmix64(seed);
+    state_[3] = splitmix64(seed);
+  }
+
+  uint32_t next_uint32() { return static_cast<uint32_t>(next()); }
+
+  uint32_t next_uint32(const uint32_t l = 0, const uint32_t r = std::numeric_limits<uint32_t>::max()) {
+    return l + static_cast<uint32_t>(next()) % (r - l + 1);
+  }
+
+  float next_float() { return static_cast<float>(next()) / static_cast<float>(std::numeric_limits<uint64_t>::max()); }
+
+  float next_float(const float l, const float r) { return l + (r - l) * next_float(); }
+
+  static uint64_t gen_seed() { return std::chrono::high_resolution_clock::now().time_since_epoch().count(); }
+
+ public:
+  template <typename Range>
+  void shuffle(Range&& r) {
+    auto first = std::begin(r);
+    auto last = std::end(r);
+    auto n = std::distance(first, last);
+
+    if (n <= 1) {
+      return;
+    }
+
+    using diff_t = typename std::iterator_traits<decltype(first)>::difference_type;
+
+    for (diff_t i = n - 1; i > 0; --i) {
+      const auto j = next() % (static_cast<uint64_t>(i) + 1);
+      std::swap(*(first + i), *(first + j));
+    }
+  }
+
+ private:
+  uint64_t next() {
+    const uint64_t result = state_[0] + state_[3];
+    const uint64_t t = state_[1] << 17;
+
+    state_[2] ^= state_[0];
+    state_[3] ^= state_[1];
+    state_[1] ^= state_[2];
+    state_[0] ^= state_[3];
+
+    state_[2] ^= t;
+    state_[3] = ((state_[3] << 45) | (state_[3] >> 19));
+
+    return result;
+  }
+
+  static uint64_t splitmix64(uint64_t& x) {
+    uint64_t z = (x += 0x9e3779b97f4a7c15);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+    return z ^ (z >> 31);
+  }
+
+ private:
+  std::array<uint64_t, 4> state_ = {};
+};
+
 class NNDescent {
  public:
   NNDescent(std::string metric, const size_t n_neighbors, const float pruning_degree_multiplier,
@@ -131,13 +202,13 @@ class NNDescent {
     num_elements_ = buf.shape[0];
     dim_ = buf.shape[1];
     dim_padded_ = (dim_ + 7) & ~7;
-    dim_aligned_ = dim_ - (dim_ & 7);
     const float* raw_data_ptr = static_cast<const float*>(buf.ptr);
 
     data_.resize(num_elements_ * dim_padded_);
     for (size_t i = 0; i < num_elements_; ++i) {
       float* row_ptr = &data_[i * dim_padded_];
       std::memcpy(row_ptr, raw_data_ptr + i * dim_, sizeof(float) * dim_);
+      std::memset(row_ptr + dim_, 0, sizeof(float) * (dim_padded_ - dim_));
     }
 
     if (normalize_) {
@@ -181,7 +252,11 @@ class NNDescent {
     assert(dim == dim_);
 
     const float* query_raw_ptr = static_cast<const float*>(buf.ptr);
-    std::vector<float, AlignedAllocator<float>> query_storage = {query_raw_ptr, query_raw_ptr + dim_padded_};
+
+    std::vector<float, AlignedAllocator<float>> query_storage = {};
+    query_storage.resize(dim_padded_);
+    std::memcpy(query_storage.data(), query_raw_ptr, sizeof(float) * dim_);
+    std::memset(query_storage.data() + dim_, 0, sizeof(float) * (dim_padded_ - dim_));
 
     if (normalize_) {
       normalize_vec(query_storage.data());
@@ -291,18 +366,12 @@ class NNDescent {
     if (sum_sq > 1e-12f) {
       float norm_inv = 1.0f / std::sqrt(sum_sq);
 
-      if (dim_aligned_ > 0) {
-        __m256 inv_vec = _mm256_set1_ps(norm_inv);
+      __m256 inv_vec = _mm256_set1_ps(norm_inv);
 
-        for (size_t i = 0; i < dim_aligned_; i += 8) {
-          __m256 v = _mm256_load_ps(&vec[i]);
-          v = _mm256_mul_ps(v, inv_vec);
-          _mm256_store_ps(&vec[i], v);
-        }
-      }
-
-      for (const auto i : std::views::iota(dim_aligned_, dim_)) {
-        vec[i] *= norm_inv;
+      for (size_t i = 0; i < dim_padded_; i += 8) {
+        __m256 v = _mm256_load_ps(&vec[i]);
+        v = _mm256_mul_ps(v, inv_vec);
+        _mm256_store_ps(&vec[i], v);
       }
     }
   }
@@ -310,26 +379,20 @@ class NNDescent {
   float compute_squared_norm(const float* vec) const {
     float sum_sq = 0.0f;
 
-    if (dim_aligned_ > 0) {
-      __m256 sum_vec = _mm256_setzero_ps();
-      for (size_t i = 0; i < dim_aligned_; i += 8) {
-        __m256 v = _mm256_load_ps(&vec[i]);
-        sum_vec = _mm256_fmadd_ps(v, v, sum_vec);
-      }
-
-      __m128 vlow = _mm256_castps256_ps128(sum_vec);
-      __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
-      __m128 vsum = _mm_add_ps(vlow, vhigh);
-
-      vsum = _mm_hadd_ps(vsum, vsum);
-      vsum = _mm_hadd_ps(vsum, vsum);
-
-      sum_sq += _mm_cvtss_f32(vsum);
+    __m256 sum_vec = _mm256_setzero_ps();
+    for (size_t i = 0; i < dim_padded_; i += 8) {
+      __m256 v = _mm256_load_ps(&vec[i]);
+      sum_vec = _mm256_fmadd_ps(v, v, sum_vec);
     }
 
-    for (const auto i : std::views::iota(dim_aligned_, dim_)) {
-      sum_sq += vec[i] * vec[i];
-    }
+    __m128 vlow = _mm256_castps256_ps128(sum_vec);
+    __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
+    __m128 vsum = _mm_add_ps(vlow, vhigh);
+
+    vsum = _mm_hadd_ps(vsum, vsum);
+    vsum = _mm_hadd_ps(vsum, vsum);
+
+    sum_sq += _mm_cvtss_f32(vsum);
 
     return sum_sq;
   }
@@ -337,29 +400,22 @@ class NNDescent {
   float compute_dist(const float* a, const float* b) const {
     float dist = 0.0f;
 
-    if (dim_aligned_ > 0) {
-      __m256 sum_vec = _mm256_setzero_ps();
-      for (size_t i = 0; i < dim_aligned_; i += 8) {
-        __m256 vec_a = _mm256_load_ps(&a[i]);
-        __m256 vec_b = _mm256_load_ps(&b[i]);
-        __m256 diff = _mm256_sub_ps(vec_a, vec_b);
-        sum_vec = _mm256_fmadd_ps(diff, diff, sum_vec);
-      }
-
-      __m128 vlow = _mm256_castps256_ps128(sum_vec);
-      __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
-      __m128 vsum = _mm_add_ps(vlow, vhigh);
-
-      vsum = _mm_hadd_ps(vsum, vsum);
-      vsum = _mm_hadd_ps(vsum, vsum);
-
-      dist += _mm_cvtss_f32(vsum);
+    __m256 sum_vec = _mm256_setzero_ps();
+    for (size_t i = 0; i < dim_padded_; i += 8) {
+      __m256 vec_a = _mm256_load_ps(&a[i]);
+      __m256 vec_b = _mm256_load_ps(&b[i]);
+      __m256 diff = _mm256_sub_ps(vec_a, vec_b);
+      sum_vec = _mm256_fmadd_ps(diff, diff, sum_vec);
     }
 
-    for (const auto i : std::views::iota(dim_aligned_, dim_)) {
-      float diff = a[i] - b[i];
-      dist += diff * diff;
-    }
+    __m128 vlow = _mm256_castps256_ps128(sum_vec);
+    __m128 vhigh = _mm256_extractf128_ps(sum_vec, 1);
+    __m128 vsum = _mm_add_ps(vlow, vhigh);
+
+    vsum = _mm_hadd_ps(vsum, vsum);
+    vsum = _mm_hadd_ps(vsum, vsum);
+
+    dist += _mm_cvtss_f32(vsum);
 
     return dist;
   }
@@ -463,31 +519,29 @@ class NNDescent {
 
     std::println("Building {} RP Trees...", n_trees);
 
-    const size_t seed = std::time(nullptr);
+    const auto seed = FastRandom::gen_seed();
 #pragma omp parallel
     {
-      std::mt19937 rng(seed + omp_get_thread_num());
+      FastRandom random = {seed + omp_get_thread_num()};
 
       std::vector<uint32_t> indices(num_elements_);
       std::ranges::iota(indices, 0u);
 
 #pragma omp for schedule(dynamic)
       for (int32_t i = 0; i < n_trees; ++i) {
-        std::ranges::shuffle(indices, rng);
-        roots_[i] = build_rp_tree(indices, rng);
+        random.shuffle(indices);
+        roots_[i] = build_rp_tree(indices, random);
       }
     }
   }
 
   void randomly_fill_graph() {
-    const size_t seed = std::time(nullptr);
-    std::uniform_int_distribution<uint32_t> dist_gen{0u, static_cast<uint32_t>(num_elements_ - 1)};
-
+    const auto seed = FastRandom::gen_seed();
     const size_t target_size = std::min(static_cast<size_t>(n_neighbors_), num_elements_ - 1);
 
 #pragma omp parallel
     {
-      std::mt19937 rng(seed + omp_get_thread_num());
+      FastRandom random = {seed + omp_get_thread_num()};
 
 #pragma omp for schedule(dynamic, 128)
       for (int32_t id = 0; id < num_elements_; ++id) {
@@ -498,7 +552,7 @@ class NNDescent {
         }
 
         while (neighbors.size() < target_size) {
-          auto rand_id = dist_gen(rng);
+          auto rand_id = random.next_uint32(0, num_elements_ - 1);
           if (rand_id == id) {
             continue;
           }
@@ -516,7 +570,7 @@ class NNDescent {
     }
   }
 
-  std::unique_ptr<RPTreeNode> build_rp_tree(const std::span<uint32_t> indices, std::mt19937 rng) {
+  std::unique_ptr<RPTreeNode> build_rp_tree(const std::span<uint32_t> indices, FastRandom& random) {
     auto node = std::make_unique<RPTreeNode>();
 
     if (indices.size() <= leaf_size_) {
@@ -541,13 +595,12 @@ class NNDescent {
     // split into two partitions:
     // left partition: closer to idx_a
     // right partition: closer to idx_b
-    std::uniform_int_distribution<size_t> idx_dist{0, indices.size() - 1};
-    uint32_t idx_a = indices[idx_dist(rng)];
-    uint32_t idx_b = indices[idx_dist(rng)];
+    uint32_t idx_a = indices[random.next_uint32(0, indices.size() - 1)];
+    uint32_t idx_b = indices[random.next_uint32(0, indices.size() - 1)];
 
     uint32_t attempts = 0;
     while (idx_a == idx_b && attempts < 10) {
-      idx_b = indices[idx_dist(rng)];
+      idx_b = indices[random.next_uint32(0, indices.size() - 1)];
       ++attempts;
     }
 
@@ -564,12 +617,12 @@ class NNDescent {
     auto left_count = indices.size() - right_count;
 
     if (left_count == 0 || right_count == 0) {
-      std::ranges::shuffle(indices, rng);
+      random.shuffle(indices);
       left_count = indices.size() / 2;
     }
 
-    node->left = build_rp_tree(indices.first(left_count), rng);
-    node->right = build_rp_tree(indices.subspan(left_count), rng);
+    node->left = build_rp_tree(indices.first(left_count), random);
+    node->right = build_rp_tree(indices.subspan(left_count), random);
 
     return node;
   }
@@ -728,17 +781,16 @@ class NNDescent {
       return true;
     };
 
-    const size_t seed = std::time(nullptr);
-    std::uniform_real_distribution<float> priority_dist{0.0f, 1.0f};
+    const auto seed = FastRandom::gen_seed();
 #pragma omp parallel
     {
-      std::mt19937 rng(seed + omp_get_thread_num());
+      FastRandom random = {seed + omp_get_thread_num()};
 
 #pragma omp for schedule(dynamic)
       for (int32_t u = 0; u < num_elements_; ++u) {
         auto& neighbors = graph_[u];
         for (const auto [v, dist, is_new] : neighbors) {
-          const auto priority = priority_dist(rng);
+          const auto priority = random.next_float();
           if (is_new) {
             checked_push(new_candidates_sketch_, u, v, priority, 0);
             checked_push(new_candidates_sketch_, v, u, priority, 0);
@@ -797,12 +849,11 @@ class NNDescent {
 
     const size_t max_degree = n_neighbors_ * pruning_degree_multiplier_;
 
-    const size_t seed = std::time(nullptr);
-    std::uniform_real_distribution<float> prob_dist{0.0f, 1.0f};
+    const auto seed = FastRandom::gen_seed();
 
 #pragma omp parallel
     {
-      std::mt19937 rng(seed + omp_get_thread_num());
+      FastRandom random = {seed + omp_get_thread_num()};
 
 #pragma omp for schedule(dynamic)
       for (int32_t i = 0; i < num_elements_; ++i) {
@@ -823,7 +874,7 @@ class NNDescent {
             float dist = compute_dist(existing.id, candidate.id);
             if (dist < candidate.dist) {
               // keep it with probability
-              if (prob_dist(rng) < pruning_prob_) {
+              if (random.next_float() < pruning_prob_) {
                 keep = false;
                 break;
               }
@@ -926,7 +977,6 @@ class NNDescent {
   size_t num_elements_ = {};
   size_t dim_ = {};
   size_t dim_padded_ = {};
-  size_t dim_aligned_ = {};
 
   std::vector<float, AlignedAllocator<float>> data_ = {};
 
